@@ -1,207 +1,169 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[codz]
-*$py.class
+!pip install -U torch
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import time
+import torch
+import torch.nn as nn
+import torch.optim as optim
 
-# C extensions
-*.so
+# ==============================
+# 🔹 Lower-level objective
+# ==============================
+def lower_objective(patients_in_hospital, consult_time, assign_time, n_beds):
+    n_patients = len(patients_in_hospital)
+    if n_patients == 0:
+        return 0
+    base_time = (consult_time + assign_time) * n_patients
+    penalty = max(0, (n_patients - n_beds) * (consult_time + assign_time) * 2)
+    return base_time + penalty
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+# ==============================
+# 🔹 Bilevel objective
+# ==============================
+def bilevel_objective(solution, travel, waiting, consult, assign, beds):
+    solution = solution.astype(int)
+    total_time = 0
+    for i, hospital_idx in enumerate(solution):
+        total_time += travel[i, hospital_idx] + waiting[hospital_idx]
+    for h in range(len(beds)):
+        patients_h = [i for i, s in enumerate(solution) if s == h]
+        total_time += lower_objective(patients_h, consult[h], assign[h], beds[h])
+    return total_time
 
-# PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
+# ==============================
+# 🔹 DQN RL Agent
+# ==============================
+class DQN(nn.Module):
+    def __init__(self, n_patients, n_hospitals, hidden=128):
+        super().__init__()
+        self.n_patients = n_patients
+        self.n_hospitals = n_hospitals
+        self.fc = nn.Sequential(
+            nn.Linear(n_patients * n_hospitals, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, n_patients * n_hospitals)
+        )
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        out = self.fc(x)
+        return out.view(-1, self.n_patients, self.n_hospitals)
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py.cover
-.hypothesis/
-.pytest_cache/
-cover/
+class DQNAgent:
+    def __init__(self, n_patients, n_hospitals, lr=0.001, gamma=0.9, epsilon=0.2):
+        self.n_patients = n_patients
+        self.n_hospitals = n_hospitals
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.model = DQN(n_patients, n_hospitals)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
+        self.loss_fn = nn.MSELoss()
 
-# Translations
-*.mo
-*.pot
+    def select_action(self, state):
+        state_tensor = torch.FloatTensor(state).unsqueeze(0)
+        if np.random.rand() < self.epsilon:
+            return np.random.randint(self.n_hospitals, size=self.n_patients)
+        with torch.no_grad():
+            q_values = self.model(state_tensor).squeeze(0).numpy()
+            return np.argmax(q_values, axis=1)
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
+    def train(self, state, action, reward, next_state):
+        state_tensor = torch.FloatTensor(state).unsqueeze(0)
+        next_state_tensor = torch.FloatTensor(next_state).unsqueeze(0)
+        q_pred = self.model(state_tensor)
+        q_target = q_pred.clone().detach()
+        for i in range(self.n_patients):
+            q_target[0, i, action[i]] = reward[i] + self.gamma * torch.max(self.model(next_state_tensor)[0, i]).item()
+        loss = self.loss_fn(q_pred, q_target)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
 
-# Flask stuff:
-instance/
-.webassets-cache
+# ==============================
+# 🔹 Run RL for one period
+# ==============================
+def run_dqn_rl(n_patients, n_hospitals, travel, waiting, consult, assign, beds, epochs=200):
+    state = np.zeros((n_patients, n_hospitals))
+    agent = DQNAgent(n_patients, n_hospitals)
+    max_possible_time = n_patients * (np.max(travel) + np.max(waiting) + np.max(consult) + np.max(assign))
+    
+    for ep in range(epochs):
+        action = agent.select_action(state)
+        solution = np.array(action)
+        reward_value = (max_possible_time - bilevel_objective(solution, travel, waiting, consult, assign, beds)) / max_possible_time
+        reward = np.full(n_patients, reward_value)
+        agent.epsilon = max(0.05, 0.2 * (0.995 ** ep))
+        next_state = np.zeros((n_patients, n_hospitals))
+        for i, a in enumerate(action):
+            next_state[i, a] = 1
+        agent.train(state, action, reward, next_state)
+        state = next_state
+    
+    best_solution = agent.select_action(state)
+    best_fit = bilevel_objective(best_solution, travel, waiting, consult, assign, beds)
+    return best_solution, best_fit
 
-# Scrapy stuff:
-.scrapy
+# ==============================
+# 🔹 Dynamic periods
+# ==============================
+n_periods = 5
+patients_init = 200
+hospitals_init = 5
+patient_growth = 0.05
+hospital_growth = 0.02
+patients_list, hospitals_list = [], []
+p, h = patients_init, hospitals_init
+for _ in range(n_periods):
+    p = max(1, int(p * (1 + patient_growth + np.random.normal(0, 0.02))))
+    h = max(1, int(h * (1 + hospital_growth + np.random.normal(0, 0.01))))
+    patients_list.append(p)
+    hospitals_list.append(h)
 
-# Sphinx documentation
-docs/_build/
+# ==============================
+# 🔹 Data generation
+# ==============================
+def generate_times(n_patients, n_hospitals):
+    travel = np.random.randint(5, 60, size=(n_patients, n_hospitals))
+    waiting = np.random.randint(10, 120, size=n_hospitals)
+    consult = np.random.randint(15, 30, size=n_hospitals)
+    assign = np.random.randint(5, 30, size=n_hospitals)
+    beds = np.random.randint(10, 50, size=n_hospitals)
+    return travel, waiting, consult, assign, beds
 
-# PyBuilder
-.pybuilder/
-target/
+# ==============================
+# 🔹 Main loop RL-only
+# ==============================
+results = []
+for period in range(n_periods):
+    n_patients = patients_list[period]
+    n_hospitals = hospitals_list[period]
+    travel, waiting, consult, assign, beds = generate_times(n_patients, n_hospitals)
+    
+    print(f"\n🗓️ Period {period+1}: {n_patients} patients, {n_hospitals} hospitals")
+    
+    start = time.time()
+    best_solution, best_fit = run_dqn_rl(n_patients, n_hospitals, travel, waiting, consult, assign, beds, epochs=200)
+    duration = time.time() - start
+    print(f"  RL-DQN => Best total time: {best_fit:.2f} min | Duration: {duration:.2f} s")
+    
+    results.append({
+        "Period": period + 1,
+        "Patients": n_patients,
+        "Hospitals": n_hospitals,
+        "BestTime": best_fit,
+        "Duration": duration
+    })
 
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# IPython
-profile_default/
-ipython_config.py
-
-# pyenv
-#   For a library or package, you might want to ignore these files since the code is
-#   intended to run in multiple environments; otherwise, check them in:
-# .python-version
-
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-#Pipfile.lock
-
-# UV
-#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#uv.lock
-
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
-#poetry.lock
-#poetry.toml
-
-# pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
-#   pdm recommends including project-wide configuration in pdm.toml, but excluding .pdm-python.
-#   https://pdm-project.org/en/latest/usage/project/#working-with-version-control
-#pdm.lock
-#pdm.toml
-.pdm-python
-.pdm-build/
-
-# pixi
-#   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
-#pixi.lock
-#   Pixi creates a virtual environment in the .pixi directory, just like venv module creates one
-#   in the .venv directory. It is recommended not to include this directory in version control.
-.pixi
-
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
-__pypackages__/
-
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
-
-# SageMath parsed files
-*.sage.py
-
-# Environments
-.env
-.envrc
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# Spyder project settings
-.spyderproject
-.spyproject
-
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Pyre type checker
-.pyre/
-
-# pytype static type analyzer
-.pytype/
-
-# Cython debug symbols
-cython_debug/
-
-# PyCharm
-#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#  and can be added to the global gitignore or merged into this file.  For a more nuclear
-#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
-
-# Abstra
-# Abstra is an AI-powered process automation framework.
-# Ignore directories containing user credentials, local state, and settings.
-# Learn more at https://abstra.io/docs
-.abstra/
-
-# Visual Studio Code
-#  Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
-#  that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#  and can be added to the global gitignore or merged into this file. However, if you prefer, 
-#  you could uncomment the following to ignore the entire vscode folder
-# .vscode/
-
-# Ruff stuff:
-.ruff_cache/
-
-# PyPI configuration file
-.pypirc
-
-# Cursor
-#  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
-#  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
-#  refer to https://docs.cursor.com/context/ignore-files
-.cursorignore
-.cursorindexingignore
-
-# Marimo
-marimo/_static/
-marimo/_lsp/
-__marimo__/
+# ==============================
+# 🔹 Visualization
+# ==============================
+df_results = pd.DataFrame(results)
+plt.figure(figsize=(12, 6))
+plt.plot(df_results["Period"], df_results["BestTime"], marker='o', label="RL-DQN")
+plt.title("Bilevel Optimal Total Time per Period (RL Only)")
+plt.xlabel("Period")
+plt.ylabel("Total time (minutes)")
+plt.legend()
+plt.grid(True)
+plt.show()
